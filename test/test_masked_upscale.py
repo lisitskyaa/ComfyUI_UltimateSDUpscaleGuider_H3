@@ -42,9 +42,11 @@ class CountingGuider:
     def __init__(self, guider):
         self._guider = guider
         self.call_count = 0
+        self.denoise_mask_flags = []
 
     def sample(self, *args, **kwargs):
         self.call_count += 1
+        self.denoise_mask_flags.append(kwargs.get("denoise_mask") is not None)
         return self._guider.sample(*args, **kwargs)
 
     def __getattr__(self, name):
@@ -79,7 +81,8 @@ def run_full(node_classes, image, guider, sampler, sigmas, vae, upscale_model, s
              mask=None, upscale_by=2.0, mode_type="Linear",
              tile_overlap_mode="Reprocess Overlap", mask_blur=0, tile_padding=32,
              seam_fix_mode="None", seam_fix_denoise=1.0, seam_fix_width=64,
-             seam_fix_mask_blur=0, seam_fix_padding=16, batch_size=1):
+             seam_fix_mask_blur=0, seam_fix_padding=16, batch_size=1,
+             anchor_context=False):
     """Run UltimateSDUpscaleGuider with masked-test defaults and return the output tensor."""
     usdu = node_classes["UltimateSDUpscaleGuider"]
     with torch.inference_mode():
@@ -106,6 +109,7 @@ def run_full(node_classes, image, guider, sampler, sigmas, vae, upscale_model, s
             tiled_decode=False,
             batch_size=batch_size,
             mask=mask,
+            anchor_context=anchor_context,
         )
     # Clone to move the result out of inference mode for in-place test helpers
     return out.clone()
@@ -115,7 +119,7 @@ def run_noupscale(node_classes, image, guider, sampler, sigmas, vae, seed,
                   mask=None, mode_type="Linear", tile_overlap_mode="Reprocess Overlap",
                   mask_blur=0, tile_padding=32, seam_fix_mode="None",
                   seam_fix_denoise=1.0, seam_fix_width=64, seam_fix_mask_blur=0,
-                  seam_fix_padding=16, batch_size=1):
+                  seam_fix_padding=16, batch_size=1, anchor_context=False):
     """Run UltimateSDUpscaleNoUpscaleGuider with masked-test defaults and return the output tensor."""
     usdu = node_classes["UltimateSDUpscaleNoUpscaleGuider"]
     with torch.inference_mode():
@@ -140,6 +144,7 @@ def run_noupscale(node_classes, image, guider, sampler, sigmas, vae, seed,
             tiled_decode=False,
             batch_size=batch_size,
             mask=mask,
+            anchor_context=anchor_context,
         )
     # Clone to move the result out of inference mode for in-place test helpers
     return out.clone()
@@ -330,6 +335,84 @@ class TestMaskedUpscale:
                             seam_fix_mask_blur=0)
 
         assert_outside_unchanged(out, input_1024, BOX_1024, margin=0)
+
+
+class TestAnchorContext:
+    """Integration tests for the anchor_context toggle on the Guider nodes."""
+
+    def test_anchor_off_mask_no_denoise_mask(
+        self, input_512, guider_setup, loaded_checkpoint, node_classes, seed
+    ):
+        """With anchor off (default), a masked run must not pass a denoise mask."""
+        guider, sampler, sigmas = guider_setup
+        _, _, vae = loaded_checkpoint
+
+        counting = CountingGuider(guider)
+        mask = make_mask(512, 512, box=(100, 100, 400, 400))
+        run_noupscale(node_classes, input_512, counting, sampler, sigmas,
+                      vae, seed, mask=mask)
+
+        assert counting.call_count == 1, \
+            f"Expected exactly 1 sampled tile, got {counting.call_count}"
+        assert counting.denoise_mask_flags == [False], \
+            "Anchor off must keep denoise_mask=None (current behavior)"
+
+    def test_anchor_on_mask_denoise_mask_passed(
+        self, input_1024, guider_setup, loaded_checkpoint, node_classes, seed,
+        test_dirs: DirectoryConfig,
+    ):
+        """Anchor on + hard box mask: every tile gets a denoise mask; composite semantics unchanged."""
+        guider, sampler, sigmas = guider_setup
+        _, _, vae = loaded_checkpoint
+
+        counting = CountingGuider(guider)
+        mask = make_mask(1024, 1024, box=BOX_1024)
+        out = run_noupscale(node_classes, input_1024, counting, sampler, sigmas,
+                            vae, seed, mask=mask, anchor_context=True)
+        save_image(out, test_dirs.sample_images / CATEGORY / ("anchored_box" + EXT))
+
+        assert counting.call_count == 4, \
+            f"Expected 4 sampled tiles, got {counting.call_count}"
+        assert all(counting.denoise_mask_flags), \
+            "Every sampled tile must receive a denoise mask with anchor on"
+        assert_outside_unchanged(out, input_1024, BOX_1024, margin=0)
+        inside_mae = region_mae(out, input_1024, BOX_1024)
+        assert inside_mae > 0.005, \
+            f"Pixels inside the mask box did not change (MAE={inside_mae})"
+
+    def test_anchor_on_no_mask_reprocess_is_noop(
+        self, input_512, guider_setup, loaded_checkpoint, node_classes, seed
+    ):
+        """Anchor on without a mask in Reprocess Overlap is a documented silent no-op."""
+        guider, sampler, sigmas = guider_setup
+        _, _, vae = loaded_checkpoint
+
+        counting = CountingGuider(guider)
+        run_noupscale(node_classes, input_512, counting, sampler, sigmas,
+                      vae, seed, anchor_context=True)
+
+        assert counting.call_count >= 1, "Expected at least one sampled tile"
+        assert counting.denoise_mask_flags == [False] * counting.call_count, \
+            "Anchor without mask in Reprocess Overlap must not pass a denoise mask"
+
+    def test_anchor_on_context_only_no_mask(
+        self, input_1024, guider_setup, loaded_checkpoint, node_classes, seed
+    ):
+        """Anchor on + Context Only Overlap (no mask): every tile gets a denoise mask."""
+        guider, sampler, sigmas = guider_setup
+        _, _, vae = loaded_checkpoint
+
+        counting = CountingGuider(guider)
+        out = run_noupscale(node_classes, input_1024, counting, sampler, sigmas,
+                            vae, seed, tile_overlap_mode="Context Only Overlap",
+                            anchor_context=True)
+
+        assert counting.call_count == 4, \
+            f"Expected 4 sampled tiles, got {counting.call_count}"
+        assert all(counting.denoise_mask_flags), \
+            "Every sampled tile must receive a denoise mask with anchor on"
+        assert out.shape == input_1024.shape, \
+            f"Output shape {tuple(out.shape)} != input shape {tuple(input_1024.shape)}"
 
 
 class TestMaskedSkipUnit:

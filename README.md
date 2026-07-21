@@ -84,6 +84,10 @@ For best results with Context Only Overlap mode:
 - Use a `tile_padding` of 64-128 pixels (this becomes the overlap width)
 - `mask_blur` of 8-16 provides smooth blending at tile edges
 - Seam fix can typically be set to "None" since seams are prevented
+- Enable `anchor_context` to make the read-only overlap a hard guarantee during sampling: the
+  already-processed overlap is anchored to the original latent at every step (inpaint-style
+  denoise mask), not just excluded at composite time. The mode is retained during seam-fix
+  passes, whose gradient masks become soft anchors.
 
 ## Masked Upscaling
 
@@ -104,6 +108,20 @@ before.
   `mask_blur=0` for a hard boundary.
 - **Any resolution.** The mask may be any size (e.g. drawn on the pre-upscale image) and is
   resized to the upscaled canvas. Grayscale values give partial blending.
+
+### Anchoring Context (anchor_context)
+
+By default, the parts of a tile that will not be composited back — everything outside the mask
+plus the tile padding ring — are freely re-diffused during sampling and then discarded at
+composite time. Enabling `anchor_context` holds those parts to the original image throughout
+sampling instead (inpaint-style denoise mask, re-noised to the current step each step), so the
+model sees the true surroundings as context rather than its own re-imagining of them. This can
+tighten blending at mask edges.
+
+- Only takes effect when a mask is connected or `tile_overlap_mode` is "Context Only Overlap";
+  otherwise it has no effect.
+- Note: an all-white mask with `anchor_context` enabled is NOT equivalent to running with no
+  mask — the tile padding ring is anchored.
 
 ### Compatibility
 

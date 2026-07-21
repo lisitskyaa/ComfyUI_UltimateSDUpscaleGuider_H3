@@ -1,7 +1,7 @@
 [project]
 name = "comfyui-ultimatesdupscale-guider"
 description = "ComfyUI nodes for Ultimate SD Upscale with Guider support and Context Only Overlap mode for seamless tiled upscaling without blur. Fork of ComfyUI_UltimateSDUpscale."
-version = "1.1.0"
+version = "1.2.0"
 license = { file = "LICENSE" }
 
 [project.optional-dependencies]

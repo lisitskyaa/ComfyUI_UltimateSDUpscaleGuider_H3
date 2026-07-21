@@ -255,6 +255,7 @@ class StableDiffusionProcessingGuider:
         seam_fix_mode,
         batch_size=1,
         region_mask=None,
+        anchor_context=False,
     ):
         # Variables used by the USDU script
         self.init_images = [init_img]
@@ -303,6 +304,8 @@ class StableDiffusionProcessingGuider:
         # Optional region mask (PIL 'L' image) limiting what is composited back
         self.region_mask = region_mask
         self._region_mask_cache = {}
+        # Optional inpaint-style anchoring of non-composited tile areas
+        self.anchor_context = anchor_context
         self.vae_decoder = VAEDecode()
         self.vae_encoder = VAEEncode()
         self.vae_decoder_tiled = VAEDecodeTiled()
@@ -562,6 +565,22 @@ def process_images(p: StableDiffusionProcessing) -> Processed:
     # Encode the image
     batched_tiles = torch.cat([pil_to_tensor(tile) for tile in tiles], dim=0)
     (latent,) = p.vae_encoder.encode(p.vae, batched_tiles)
+
+    # Optional inpaint-style anchoring: give the sampler a denoise mask so the
+    # non-composited parts of the tile (masked-out areas, CONTEXT_ONLY
+    # already-processed overlap, and the tile-padding ring) are renoised from
+    # the original latent at every step instead of freely redrawn and discarded.
+    if getattr(p, 'anchor_context', False) and (
+            region_mask is not None
+            or p.tile_overlap_mode == TileOverlapMode.CONTEXT_ONLY):
+        noise_mask = image_mask.crop(crop_region)
+        if noise_mask.size != tile_size:
+            # BILINEAR deliberately: monotone, stays in [0, 1]; LANCZOS (used
+            # for the image tile) rings past the range on hard mask edges.
+            noise_mask = noise_mask.resize(tile_size, Image.Resampling.BILINEAR)
+        mask_tensor = torch.from_numpy(np.array(noise_mask).astype(np.float32) / 255.0)
+        # Same shape convention as ComfyUI's SetLatentNoiseMask: [B, 1, H, W]
+        latent["noise_mask"] = mask_tensor.reshape((-1, 1, mask_tensor.shape[-2], mask_tensor.shape[-1]))
 
     # Generate samples - use guider path or standard path
     if getattr(p, 'use_guider', False):

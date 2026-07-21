@@ -121,6 +121,7 @@ def USDU_guider_base_inputs():
 
     optional = [
         ("mask", ("MASK", {"tooltip": "Optional region mask. Only masked (white) areas are re-diffused; tiles that do not touch the mask are skipped entirely, which greatly speeds up small-region upscales. Sampling still sees the full tile for context, and blending uses the same mask_blur feathering as tile edges (the edit extends about mask_blur pixels past the mask). The mask may be any resolution and is resized to the upscaled canvas. Grayscale values give partial blending. Not compatible with batch_size > 1."})),
+        ("anchor_context", ("BOOLEAN", {"default": False, "tooltip": "Anchor everything a tile will not composite back — masked-out areas, already-processed Context Only overlap, and the tile padding ring — to the original image at every sampling step (inpaint-style denoise mask). The model then sees the true surroundings as context at each step instead of its own re-imagining of them, which can tighten blending at mask edges and tile seams. Only takes effect when a mask is connected or tile_overlap_mode is 'Context Only Overlap'; otherwise it has no effect. Off preserves existing behavior."})),
     ]
 
     return required, optional
@@ -306,7 +307,7 @@ class UltimateSDUpscaleGuider:
                 upscale_model, mode_type, tile_width, tile_height, mask_blur, tile_padding,
                 seam_fix_mode, seam_fix_denoise, seam_fix_mask_blur,
                 seam_fix_width, seam_fix_padding, tile_overlap_mode, tiled_decode, batch_size=1,
-                mask=None):
+                mask=None, anchor_context=False):
 
         tile_overlap_mode_enum = TILE_OVERLAP_MODES[tile_overlap_mode]
 
@@ -352,6 +353,7 @@ class UltimateSDUpscaleGuider:
             tile_width, tile_height, redraw_mode, seam_fix_mode_enum,
             batch_size,
             region_mask=region_mask,
+            anchor_context=anchor_context,
         )
 
         # Suppress logging to prevent duplicate tqdm progress bars
@@ -398,13 +400,13 @@ class UltimateSDUpscaleNoUpscaleGuider(UltimateSDUpscaleGuider):
                 mode_type, tile_width, tile_height, mask_blur, tile_padding,
                 seam_fix_mode, seam_fix_denoise, seam_fix_mask_blur,
                 seam_fix_width, seam_fix_padding, tile_overlap_mode, tiled_decode, batch_size=1,
-                mask=None):
+                mask=None, anchor_context=False):
         upscale_by = 1.0
         return super().upscale(upscaled_image, guider, sampler, sigmas, vae, upscale_by, seed,
                                None, mode_type, tile_width, tile_height, mask_blur, tile_padding,
                                seam_fix_mode, seam_fix_denoise, seam_fix_mask_blur,
                                seam_fix_width, seam_fix_padding, tile_overlap_mode, tiled_decode, batch_size,
-                               mask=mask)
+                               mask=mask, anchor_context=anchor_context)
 
 
 # A dictionary that contains all nodes you want to export with their names
