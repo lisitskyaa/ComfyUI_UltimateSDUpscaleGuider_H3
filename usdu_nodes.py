@@ -121,7 +121,7 @@ def USDU_guider_base_inputs():
 
     optional = [
         ("mask", ("MASK", {"tooltip": "Optional region mask. Only masked (white) areas are re-diffused; tiles that do not touch the mask are skipped entirely, which greatly speeds up small-region upscales. Sampling still sees the full tile for context, and blending uses the same mask_blur feathering as tile edges (the edit extends about mask_blur pixels past the mask). The mask may be any resolution and is resized to the upscaled canvas. Grayscale values give partial blending. Not compatible with batch_size > 1."})),
-        ("anchor_context", ("BOOLEAN", {"default": False, "tooltip": "Anchor everything a tile will not composite back — masked-out areas, already-processed Context Only overlap, and the tile padding ring — to the original image at every sampling step (inpaint-style denoise mask). The model then sees the true surroundings as context at each step instead of its own re-imagining of them, which can tighten blending at mask edges and tile seams. Only takes effect when a mask is connected or tile_overlap_mode is 'Context Only Overlap'; otherwise it has no effect. Off preserves existing behavior."})),
+        ("anchor_context", ("BOOLEAN", {"default": False, "tooltip": "Hold the areas a tile will not composite back to the original image at every sampling step, so the model sees the true surroundings instead of a re-diffused version that can drift. Keeps detail consistent between sections and blends seams into the real image. Takes effect when a mask is connected or tile_overlap_mode is 'Context Only Overlap'; otherwise it has no effect."})),
     ]
 
     return required, optional

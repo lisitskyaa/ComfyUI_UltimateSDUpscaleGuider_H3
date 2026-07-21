@@ -43,10 +43,15 @@ class CountingGuider:
         self._guider = guider
         self.call_count = 0
         self.denoise_mask_flags = []
+        self.denoise_masks = []  # captured denoise_mask tensors (None where absent)
 
     def sample(self, *args, **kwargs):
         self.call_count += 1
-        self.denoise_mask_flags.append(kwargs.get("denoise_mask") is not None)
+        denoise_mask = kwargs.get("denoise_mask")
+        self.denoise_mask_flags.append(denoise_mask is not None)
+        self.denoise_masks.append(
+            None if denoise_mask is None else denoise_mask.detach().cpu().clone()
+        )
         return self._guider.sample(*args, **kwargs)
 
     def __getattr__(self, name):
@@ -413,6 +418,40 @@ class TestAnchorContext:
             "Every sampled tile must receive a denoise mask with anchor on"
         assert out.shape == input_1024.shape, \
             f"Output shape {tuple(out.shape)} != input shape {tuple(input_1024.shape)}"
+
+    def test_anchor_on_blurred_mask_denoise_mask_is_binary(
+        self, input_1024, guider_setup, loaded_checkpoint, node_classes, seed
+    ):
+        """With mask_blur > 0, the denoise mask must be BINARY.
+
+        The whole mask_blur feather band must fully denoise (1.0) and only
+        pixels the composite fully preserves may be anchored (0.0). A grayscale
+        denoise mask re-anchors the feather band a fraction at EVERY step,
+        which compounds across steps and leaves the band as an unrefined
+        low-detail halo around the mask.
+        """
+        guider, sampler, sigmas = guider_setup
+        _, _, vae = loaded_checkpoint
+
+        counting = CountingGuider(guider)
+        out = run_noupscale(node_classes, input_1024, counting, sampler, sigmas,
+                            vae, seed, mask=make_mask(1024, 1024, BOX_1024),
+                            mask_blur=16, anchor_context=True)
+
+        assert counting.call_count == 4, \
+            f"Expected 4 sampled tiles, got {counting.call_count}"
+        assert all(counting.denoise_mask_flags), \
+            "Every sampled tile must receive a denoise mask with anchor on"
+        for i, dm in enumerate(counting.denoise_masks):
+            values = torch.unique(dm)
+            assert all(v.item() in (0.0, 1.0) for v in values), \
+                (f"Tile {i}: denoise mask must be binary so the feather band is "
+                 f"fully refined; found fractional values {values.tolist()[:8]}")
+        assert any(torch.unique(dm).numel() == 2 for dm in counting.denoise_masks), \
+            "At least one tile should contain both anchored and denoised pixels"
+        # Beyond the box plus the blur's reach, output must still be untouched
+        # (PIL GaussianBlur radius 16 extends < 64 px).
+        assert_outside_unchanged(out, input_1024, BOX_1024, margin=64)
 
 
 class TestMaskedSkipUnit:

@@ -579,6 +579,13 @@ def process_images(p: StableDiffusionProcessing) -> Processed:
             # for the image tile) rings past the range on hard mask edges.
             noise_mask = noise_mask.resize(tile_size, Image.Resampling.BILINEAR)
         mask_tensor = torch.from_numpy(np.array(noise_mask).astype(np.float32) / 255.0)
+        # Binarize: fully denoise every pixel the composite can touch (any
+        # nonzero alpha, including the whole mask_blur feather band) and anchor
+        # only pixels the composite fully preserves. A grayscale denoise mask
+        # would re-anchor the feather band a fraction at EVERY step, which
+        # compounds across steps and leaves the band as an unrefined
+        # low-detail halo around the mask.
+        mask_tensor = (mask_tensor > 0.0).to(torch.float32)
         # Same shape convention as ComfyUI's SetLatentNoiseMask: [B, 1, H, W]
         latent["noise_mask"] = mask_tensor.reshape((-1, 1, mask_tensor.shape[-2], mask_tensor.shape[-1]))
 

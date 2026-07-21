@@ -1,17 +1,17 @@
 # ComfyUI_UltimateSDUpscaleGuider
 
-> **This is a fork of [ComfyUI_UltimateSDUpscale](https://github.com/ssitu/ComfyUI_UltimateSDUpscale) with added Guider support.**
+> **A fork of [ComfyUI_UltimateSDUpscale](https://github.com/ssitu/ComfyUI_UltimateSDUpscale) with Guider support, Context Only Overlap, Masked Upscaling, and context anchoring.**
 
-[ComfyUI](https://github.com/comfyanonymous/ComfyUI) nodes for performing the image-to-image diffusion process on large images in tiles. This approach improves the details that is commonly found on upscaled images while reducing hardware requirements and maintaining an image size that the diffusion model is trained on.
+[ComfyUI](https://github.com/comfyanonymous/ComfyUI) nodes for running the image-to-image diffusion process on large images in tiles. Tiling improves the detail commonly lost on upscaled images while keeping VRAM use low and the working size close to what the diffusion model was trained on.
 
 ## Fork Changes
 
-This fork adds two key improvements over the original Ultimate SD Upscale:
+1. **Guider input support**: drive tiled upscaling with any custom guider. For example, PerpNegGuider enables negative prompts at CFG 1 for higher quality upscales.
+2. **Context Only Overlap mode**: tiles use already-generated neighbor pixels as context without re-denoising them, which greatly improves consistency and removes seams.
+3. **Masked Upscaling**: an optional mask restricts re-diffusion to a region, so different parts of an image can be upscaled with different models or settings, or an inpainted patch refined to match its surroundings.
+4. **Context anchoring** (`anchor_context`): holds unprocessed areas to the original image during sampling, preventing detail drift between sections and joining seams to the real image.
 
-1. **Guider input support** - Use custom guiders (PerpNegGuider, CFGGuider, etc.) during tiled upscaling
-2. **Context Only Overlap mode** - A new tile processing mode that eliminates seams without the blur that comes from seam fix
-
-### New Nodes Added
+### New Nodes
 
 | Node | Description |
 |------|-------------|
@@ -20,13 +20,12 @@ This fork adds two key improvements over the original Ultimate SD Upscale:
 
 ### What's Different
 
-The new Guider nodes accept:
-- **GUIDER** - A guider that encapsulates model, conditioning, and CFG (from PerpNegGuider, CFGGuider, etc.)
-- **SAMPLER** - From KSamplerSelect node
-- **SIGMAS** - From BasicScheduler or other scheduler nodes (configure denoise here)
+The Guider nodes accept:
+- **GUIDER**: encapsulates model, conditioning, and CFG (from PerpNegGuider, CFGGuider, etc.)
+- **SAMPLER**: from KSamplerSelect
+- **SIGMAS**: from BasicScheduler or other scheduler nodes (configure denoise here)
 
-Instead of the standard nodes' separate inputs for:
-- model, positive, negative, cfg, sampler_name, scheduler, steps, denoise
+These replace the standard nodes' separate model, positive, negative, cfg, sampler_name, scheduler, steps, and denoise inputs.
 
 ### Example Workflow
 
@@ -41,26 +40,19 @@ Instead of the standard nodes' separate inputs for:
 
 ### Note on Conditioning
 
-The Guider nodes skip per-tile conditioning cropping since conditioning is internal to the guider. This works perfectly for text-based guiders (PerpNegGuider, CFGGuider). For spatial conditioning (ControlNet, GLIGEN), use the original non-Guider nodes instead.
+The Guider nodes skip per-tile conditioning cropping since conditioning is internal to the guider. This works for text-based guiders (PerpNegGuider, CFGGuider). For spatial conditioning (ControlNet, GLIGEN), use the original non-Guider nodes instead.
 
 ---
 
 ## Context Only Overlap Mode
 
-### The Problem with Traditional Tiled Upscaling
+Tiles are processed independently, so pixels at tile boundaries are generated separately and can show seams. The usual remedy is a seam fix pass, which costs extra time and can blur.
 
-When upscaling large images with tiles, each tile is processed independently. Even with padding for context, the actual pixels at tile boundaries are generated separately, leading to visible seams where tiles meet.
+Context Only Overlap prevents the seams instead of fixing them afterward:
 
-The traditional solution is **seam fix** - a post-processing pass that re-processes the seam areas. While effective, seam fix can introduce blur and requires additional processing time.
-
-### Our Solution: Prevent Seams Instead of Fixing Them
-
-The **Context Only Overlap** mode takes a different approach: instead of fixing seams after they occur, it prevents them from happening in the first place.
-
-**How it works:**
-1. Each tile extends into its neighbors' territory by the `tile_padding` amount
-2. When processing subsequent tiles, the already-denoised overlap regions are used as **context for the attention mechanism** but are **not re-denoised**
-3. This allows each tile to "see" what its neighbors generated and create coherent continuations
+1. Each tile extends into its neighbors by the `tile_padding` amount.
+2. Already-denoised overlap regions are used as context for the attention mechanism but are not re-denoised.
+3. Each tile sees what its neighbors generated and continues it coherently, including at edge and corner tiles.
 
 ### Tile Overlap Mode Options
 
@@ -70,70 +62,44 @@ The **Context Only Overlap** mode takes a different approach: instead of fixing 
 | **Reprocess Overlap** | Uniform tile sizes, overlap regions may be generated independently | Original behavior, seams possible |
 | **Context Only Overlap** | Overlap regions provide context without re-denoising | Best coherence, no seam fix blur |
 
-### Benefits of Context Only Overlap
-
-- **No seams at tile boundaries** - Tiles share context and create coherent transitions
-- **No blur from seam fix** - Eliminates the need for post-processing seam fix passes
-- **More coherent images** - Adjacent tiles "see" each other's output through the overlap context
-- **Works with all tile positions** - Including edge and corner tiles (bidirectional context sharing)
-
 ### Recommended Settings
 
-For best results with Context Only Overlap mode:
 - Set `tile_overlap_mode` to "Context Only Overlap"
 - Use a `tile_padding` of 64-128 pixels (this becomes the overlap width)
 - `mask_blur` of 8-16 provides smooth blending at tile edges
 - Seam fix can typically be set to "None" since seams are prevented
-- Enable `anchor_context` to make the read-only overlap a hard guarantee during sampling: the
-  already-processed overlap is anchored to the original latent at every step (inpaint-style
-  denoise mask), not just excluded at composite time. The mode is retained during seam-fix
-  passes, whose gradient masks become soft anchors.
+- Enable `anchor_context` to hold the overlap context fixed during sampling as well, not just at composite time (see Anchoring Context below)
 
 ## Masked Upscaling
 
-Both Guider nodes accept an optional `mask` input (MASK type). White areas of the mask are
-re-diffused; black areas are left untouched. With no mask connected, behavior is identical to
-before.
+Both Guider nodes accept an optional `mask` input. White areas are re-diffused; black areas are left untouched. With no mask connected, behavior is unchanged.
 
 ### How It Works
 
-- **Tile skipping is the speed win.** Tiles whose rectangle does not touch the mask are skipped
-  entirely — no VAE encode, no sampling. A mask covering a small region of a large image only pays
-  for the tiles it touches.
-- **Full tile context.** Tiles that do touch the mask are sampled exactly as without a mask — the
-  model sees the full tile, so the re-diffused region blends with real surroundings.
-- **Same feathering as tile seams.** The mask is intersected with each tile's own mask and
-  feathered by the existing `mask_blur`, so region boundaries blend with the exact same process
-  tile seams already use. Note the edit extends about `mask_blur` pixels past the mask edge; use
-  `mask_blur=0` for a hard boundary.
-- **Any resolution.** The mask may be any size (e.g. drawn on the pre-upscale image) and is
-  resized to the upscaled canvas. Grayscale values give partial blending.
+- **Tile skipping.** Tiles that do not touch the mask are skipped entirely, with no VAE encode and no sampling, so a small region only pays for the tiles it touches.
+- **Full tile context.** Processed tiles still see the whole tile, so the re-diffused region blends with its real surroundings.
+- **Same feathering as tile seams.** The mask is feathered by `mask_blur`, and the edit extends about `mask_blur` pixels past the mask edge. Use `mask_blur=0` for a hard boundary.
+- **Any resolution.** The mask is resized to the upscaled canvas, so it can be drawn on the pre-upscale image. Grayscale values give partial blending.
 
 ### Anchoring Context (anchor_context)
 
-By default, the parts of a tile that will not be composited back — everything outside the mask
-plus the tile padding ring — are freely re-diffused during sampling and then discarded at
-composite time. Enabling `anchor_context` holds those parts to the original image throughout
-sampling instead (inpaint-style denoise mask, re-noised to the current step each step), so the
-model sees the true surroundings as context rather than its own re-imagining of them. This can
-tighten blending at mask edges.
+By default, areas a tile will not keep are still re-diffused during sampling and thrown away afterward, so the model works against a re-imagined version of the surroundings that can drift from the real image. Enabling `anchor_context` holds those areas to the original image at every sampling step, so the model always sees the true surroundings.
 
-- Only takes effect when a mask is connected or `tile_overlap_mode` is "Context Only Overlap";
-  otherwise it has no effect.
-- Note: an all-white mask with `anchor_context` enabled is NOT equivalent to running with no
-  mask — the tile padding ring is anchored.
+In practice:
+
+- Details stay consistent across sections instead of drifting apart during denoising, giving a more even and slightly sharper result across the whole image.
+- Seams blend better because new content is joined to the real image rather than to a drifted version of it.
+- Anchoring applies only to pixels the composite will not replace; everything that gets composited is still fully refined.
+- Takes effect when a mask is connected or `tile_overlap_mode` is "Context Only Overlap"; otherwise it does nothing.
 
 ### Compatibility
 
-- Works with all three `tile_overlap_mode` values and all seam fix modes (seam fix passes are
-  clipped to the masked region the same way).
-- NOT compatible with `batch_size > 1` — the node raises an error; use `batch_size=1` with a mask.
+- Works with all three `tile_overlap_mode` values and all seam fix modes (seam fix passes are clipped to the masked region the same way).
+- Not compatible with `batch_size > 1`; the node raises an error. Use `batch_size=1` with a mask.
 
 ### Use Case 1: Two-Stage Region Upscaling
 
-Upscale the background and a character with different guider/sampler/sigmas each, in one chained
-workflow. Run the background pass first so the character pass sees the finished background as tile
-context:
+Upscale the background and a character with different guider/sampler/sigmas each, in one chained workflow. Run the background pass first so the character pass sees the finished background as tile context:
 
 ```
 [Mask] ──► [InvertMask] ──► mask ┐
@@ -146,9 +112,7 @@ context:
 
 ### Use Case 2: Upscale Inpainting for Huge Images
 
-Inpainting a huge image directly is expensive. Instead: downsample a copy, inpaint on the small
-copy, paste the upscaled patch back into the full-size image, then use the No Upscale node with a
-mask over the patched region to re-diffuse only that region so it matches the rest:
+Inpainting a huge image directly is expensive. Instead: downsample a copy, inpaint on the small copy, paste the upscaled patch back into the full-size image, then use the No Upscale node with a mask over the patched region to re-diffuse only that region so it matches the rest:
 
 ```
 [Huge Image] ─► [Downscale] ─► [Inpaint] ─► [Upscale patch + paste back] ─┐
