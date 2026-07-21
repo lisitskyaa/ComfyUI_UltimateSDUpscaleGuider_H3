@@ -97,26 +97,40 @@ class ProcessedRegionTracker:
         return full_mask
 
 
-def get_region_mask_for_canvas(p, canvas_size):
-    """Return p.region_mask resized to canvas_size ('L'), cached on p by size.
+def get_region_masks_for_canvas(p, canvas_size):
+    """Return (per_image_masks, union_mask) at canvas_size ('L'), cached on p by size.
 
-    Returns None when no region mask is set (including non-guider processing).
+    p.region_mask may be None, a single PIL mask shared by every image in the
+    batch, or a list with one mask per image in shared.batch. Returns
+    (None, None) when no region mask is set (including non-guider processing).
+    per_image_masks is None when a single shared mask is set. The union mask
+    drives tile skipping and CONTEXT_ONLY bookkeeping: a tile is processed
+    when ANY image in the batch needs it.
     canvas_size must be image_mask.size -- p.width/p.height hold the PER-TILE
     processing size inside process_images, NOT the canvas size.
     """
     region_mask = getattr(p, 'region_mask', None)
     if region_mask is None:
-        return None
+        return None, None
     cache = getattr(p, '_region_mask_cache', None)
     if cache is None:
         cache = p._region_mask_cache = {}
     if canvas_size not in cache:
-        if region_mask.size == canvas_size:
-            cache[canvas_size] = region_mask
+        # BILINEAR deliberately: monotone, no LANCZOS ringing on hard
+        # edges; mask_blur feathers afterwards.
+        if isinstance(region_mask, list):
+            resized = [
+                m if m.size == canvas_size
+                else m.resize(canvas_size, Image.Resampling.BILINEAR)
+                for m in region_mask
+            ]
+            union = Image.fromarray(
+                np.maximum.reduce([np.array(m) for m in resized]), mode='L')
+            cache[canvas_size] = (resized, union)
+        elif region_mask.size == canvas_size:
+            cache[canvas_size] = (None, region_mask)
         else:
-            # BILINEAR deliberately: monotone, no LANCZOS ringing on hard
-            # edges; mask_blur feathers afterwards.
-            cache[canvas_size] = region_mask.resize(canvas_size, Image.Resampling.BILINEAR)
+            cache[canvas_size] = (None, region_mask.resize(canvas_size, Image.Resampling.BILINEAR))
     return cache[canvas_size]
 
 
@@ -301,7 +315,9 @@ class StableDiffusionProcessingGuider:
         self.processed_tracker: Optional[ProcessedRegionTracker] = None
         self.tiled_decode = tiled_decode
         self.batch_size = batch_size
-        # Optional region mask (PIL 'L' image) limiting what is composited back
+        # Optional region mask limiting what is composited back: a single PIL
+        # 'L' image shared by every image in the batch, or a list with one
+        # mask per image
         self.region_mask = region_mask
         self._region_mask_cache = {}
         # Optional inpaint-style anchoring of non-composited tile areas
@@ -460,7 +476,10 @@ def process_images(p: StableDiffusionProcessing) -> Processed:
     # crop_region was already computed from the full tile rect above, so the
     # sampled tile context is unchanged; the region only limits what is
     # composited back (and lets non-intersecting tiles be skipped entirely).
-    region_mask = get_region_mask_for_canvas(p, image_mask.size)
+    # With per-image masks, the union decides skipping (a tile is processed
+    # when ANY image needs it); the per-image intersection happens after the
+    # overlap-mode block below.
+    per_image_regions, region_mask = get_region_masks_for_canvas(p, image_mask.size)
     if region_mask is not None:
         combined = np.minimum(np.array(image_mask), np.array(region_mask))
         if not combined.any():
@@ -547,9 +566,25 @@ def process_images(p: StableDiffusionProcessing) -> Processed:
                     p.pbar.update(1)
                 return Processed(p, [], p.seed, "")
 
+    # Per-image composite masks: intersect the (union-clipped) tile mask with
+    # each image's own region. Each region is <= the union pointwise, so this
+    # subsumes the union clip above. Left as None for a single shared mask, in
+    # which case image_mask serves every image as before.
+    composite_masks = None
+    if per_image_regions is not None:
+        mask_array = np.array(image_mask)
+        composite_masks = [
+            Image.fromarray(np.minimum(mask_array, np.array(rm)), mode='L')
+            for rm in per_image_regions
+        ]
+
     # Blur the mask
     if p.mask_blur > 0:
-        image_mask = image_mask.filter(ImageFilter.GaussianBlur(p.mask_blur))
+        if composite_masks is not None:
+            composite_masks = [m.filter(ImageFilter.GaussianBlur(p.mask_blur))
+                               for m in composite_masks]
+        else:
+            image_mask = image_mask.filter(ImageFilter.GaussianBlur(p.mask_blur))
 
     # Crop the images to get the tiles that will be used for generation
     tiles = [img.crop(crop_region) for img in shared.batch]
@@ -573,21 +608,28 @@ def process_images(p: StableDiffusionProcessing) -> Processed:
     if getattr(p, 'anchor_context', False) and (
             region_mask is not None
             or p.tile_overlap_mode == TileOverlapMode.CONTEXT_ONLY):
-        noise_mask = image_mask.crop(crop_region)
-        if noise_mask.size != tile_size:
-            # BILINEAR deliberately: monotone, stays in [0, 1]; LANCZOS (used
-            # for the image tile) rings past the range on hard mask edges.
-            noise_mask = noise_mask.resize(tile_size, Image.Resampling.BILINEAR)
-        mask_tensor = torch.from_numpy(np.array(noise_mask).astype(np.float32) / 255.0)
-        # Binarize: fully denoise every pixel the composite can touch (any
-        # nonzero alpha, including the whole mask_blur feather band) and anchor
-        # only pixels the composite fully preserves. A grayscale denoise mask
-        # would re-anchor the feather band a fraction at EVERY step, which
-        # compounds across steps and leaves the band as an unrefined
-        # low-detail halo around the mask.
-        mask_tensor = (mask_tensor > 0.0).to(torch.float32)
-        # Same shape convention as ComfyUI's SetLatentNoiseMask: [B, 1, H, W]
-        latent["noise_mask"] = mask_tensor.reshape((-1, 1, mask_tensor.shape[-2], mask_tensor.shape[-1]))
+        anchor_masks = composite_masks if composite_masks is not None else [image_mask]
+        mask_rows = []
+        for anchor_mask in anchor_masks:
+            noise_mask = anchor_mask.crop(crop_region)
+            if noise_mask.size != tile_size:
+                # BILINEAR deliberately: monotone, stays in [0, 1]; LANCZOS (used
+                # for the image tile) rings past the range on hard mask edges.
+                noise_mask = noise_mask.resize(tile_size, Image.Resampling.BILINEAR)
+            mask_tensor = torch.from_numpy(np.array(noise_mask).astype(np.float32) / 255.0)
+            # Binarize: fully denoise every pixel the composite can touch (any
+            # nonzero alpha, including the whole mask_blur feather band) and anchor
+            # only pixels the composite fully preserves. A grayscale denoise mask
+            # would re-anchor the feather band a fraction at EVERY step, which
+            # compounds across steps and leaves the band as an unrefined
+            # low-detail halo around the mask.
+            mask_rows.append((mask_tensor > 0.0).to(torch.float32))
+        # Same shape convention as ComfyUI's SetLatentNoiseMask: [B, 1, H, W].
+        # A single row broadcasts across the whole latent batch (ComfyUI's
+        # reshape_mask repeats it); per-image masks give one row per image,
+        # anchoring each image to its own original content.
+        stacked = torch.stack(mask_rows)
+        latent["noise_mask"] = stacked.reshape((-1, 1, stacked.shape[-2], stacked.shape[-1]))
 
     # Generate samples - use guider path or standard path
     if getattr(p, 'use_guider', False):
@@ -615,6 +657,7 @@ def process_images(p: StableDiffusionProcessing) -> Processed:
 
     for i, tile_sampled in enumerate(tiles_sampled):
         init_image = shared.batch[i]
+        tile_mask = composite_masks[i] if composite_masks is not None else image_mask
 
         # Resize back to the original size
         if tile_sampled.size != initial_tile_size:
@@ -627,7 +670,7 @@ def process_images(p: StableDiffusionProcessing) -> Processed:
         # Add the mask as an alpha channel
         # Must make a copy due to the possibility of an edge becoming black
         temp = image_tile_only.copy()
-        temp.putalpha(image_mask)
+        temp.putalpha(tile_mask)
         image_tile_only.paste(temp, image_tile_only)
 
         # Add back the tile to the initial image according to the mask in the alpha channel

@@ -23,6 +23,11 @@ CATEGORY = pathlib.Path("masked_upscale")
 # Hard box used by most masked tests, in 1024-canvas coordinates (x1, y1, x2, y2)
 BOX_1024 = (300, 300, 800, 800)
 
+# Per-image batch boxes: each touches exactly one tile of the 2x2 grid
+# (crop regions with padding stay within ~544px of their tile corner)
+BOX_A = (100, 100, 400, 400)  # tile (0, 0) only
+BOX_B = (600, 600, 900, 900)  # tile (1, 1) only
+
 
 #
 # # Helpers
@@ -197,6 +202,12 @@ def input_1024(input_512):
     pil = tensor_to_pil(input_512)
     pil = pil.resize((1024, 1024), Image.Resampling.LANCZOS)
     return pil_to_tensor(pil)
+
+
+@pytest.fixture(scope="module")
+def input_1024_batch2(input_1024):
+    """[2, 1024, 1024, 3] batch: the base image and its horizontal mirror."""
+    return torch.cat([input_1024, input_1024.flip(dims=[2])], dim=0)
 
 
 #
@@ -452,6 +463,137 @@ class TestAnchorContext:
         # Beyond the box plus the blur's reach, output must still be untouched
         # (PIL GaussianBlur radius 16 extends < 64 px).
         assert_outside_unchanged(out, input_1024, BOX_1024, margin=64)
+
+
+class TestImageBatch:
+    """Batched images with masks and anchor_context: mask[i] applies to image[i]."""
+
+    def test_batch_per_image_masks(
+        self, input_1024_batch2, guider_setup, loaded_checkpoint, node_classes, seed,
+        test_dirs: DirectoryConfig,
+    ):
+        """Two images, two different box masks: each image changes only inside its OWN box."""
+        guider, sampler, sigmas = guider_setup
+        _, _, vae = loaded_checkpoint
+
+        counting = CountingGuider(guider)
+        masks = torch.cat([make_mask(1024, 1024, BOX_A),
+                           make_mask(1024, 1024, BOX_B)], dim=0)
+        out = run_noupscale(node_classes, input_1024_batch2, counting, sampler, sigmas,
+                            vae, seed, mask=masks)
+        save_image(out[0:1], test_dirs.sample_images / CATEGORY / ("batch_mask_a" + EXT))
+        save_image(out[1:2], test_dirs.sample_images / CATEGORY / ("batch_mask_b" + EXT))
+
+        assert out.shape == input_1024_batch2.shape
+        # Union-based skipping: only the two tiles the boxes touch are sampled
+        assert counting.call_count == 2, \
+            f"Expected 2 sampled tiles (union skip), got {counting.call_count}"
+        # Image 0 must change only inside box A (so box B stays untouched in it)
+        assert_outside_unchanged(out[0:1], input_1024_batch2[0:1], BOX_A)
+        assert region_mae(out[0:1], input_1024_batch2[0:1], BOX_A) > 0.005, \
+            "Image 0 did not change inside its own mask box"
+        # Image 1 must change only inside box B
+        assert_outside_unchanged(out[1:2], input_1024_batch2[1:2], BOX_B)
+        assert region_mae(out[1:2], input_1024_batch2[1:2], BOX_B) > 0.005, \
+            "Image 1 did not change inside its own mask box"
+
+    def test_batch_single_mask_broadcasts(
+        self, input_1024_batch2, guider_setup, loaded_checkpoint, node_classes, seed
+    ):
+        """Two images, one mask: the mask applies to every image in the batch."""
+        guider, sampler, sigmas = guider_setup
+        _, _, vae = loaded_checkpoint
+
+        counting = CountingGuider(guider)
+        out = run_noupscale(node_classes, input_1024_batch2, counting, sampler, sigmas,
+                            vae, seed, mask=make_mask(1024, 1024, BOX_A))
+
+        assert counting.call_count == 1, \
+            f"Expected exactly 1 sampled tile, got {counting.call_count}"
+        for i in range(2):
+            assert_outside_unchanged(out[i:i + 1], input_1024_batch2[i:i + 1], BOX_A)
+            assert region_mae(out[i:i + 1], input_1024_batch2[i:i + 1], BOX_A) > 0.005, \
+                f"Image {i} did not change inside the shared mask box"
+
+    def test_batch_anchor_denoise_mask_rows(
+        self, input_1024_batch2, guider_setup, loaded_checkpoint, node_classes, seed
+    ):
+        """Anchor on + per-image masks: one binary denoise-mask row per image.
+
+        Linear order visits tile (0, 0) first (only image 0's box A is active
+        there) and tile (1, 1) second (only image 1's box B is active).
+        """
+        guider, sampler, sigmas = guider_setup
+        _, _, vae = loaded_checkpoint
+
+        counting = CountingGuider(guider)
+        masks = torch.cat([make_mask(1024, 1024, BOX_A),
+                           make_mask(1024, 1024, BOX_B)], dim=0)
+        out = run_noupscale(node_classes, input_1024_batch2, counting, sampler, sigmas,
+                            vae, seed, mask=masks, anchor_context=True)
+
+        assert counting.call_count == 2, \
+            f"Expected 2 sampled tiles, got {counting.call_count}"
+        assert all(counting.denoise_mask_flags), \
+            "Every sampled tile must receive a denoise mask with anchor on"
+        for i, dm in enumerate(counting.denoise_masks):
+            assert dm.shape[0] == 2, \
+                f"Tile {i}: expected one denoise-mask row per image, got shape {tuple(dm.shape)}"
+            values = torch.unique(dm)
+            assert all(v.item() in (0.0, 1.0) for v in values), \
+                f"Tile {i}: denoise mask must be binary; found {values.tolist()[:8]}"
+        first, second = counting.denoise_masks
+        assert first[0].sum() > 0 and first[1].sum() == 0, \
+            "Tile (0,0): image 0's row must denoise, image 1's row must be fully anchored"
+        assert second[0].sum() == 0 and second[1].sum() > 0, \
+            "Tile (1,1): image 1's row must denoise, image 0's row must be fully anchored"
+        # Composite semantics unchanged by anchoring
+        assert_outside_unchanged(out[0:1], input_1024_batch2[0:1], BOX_A)
+        assert_outside_unchanged(out[1:2], input_1024_batch2[1:2], BOX_B)
+
+
+class TestRegionMaskHelperUnit:
+    """No-GPU unit tests for get_region_masks_for_canvas."""
+
+    def test_single_mask_returns_no_per_image(self):
+        """A single shared mask yields (None, resized_mask) — the pre-batch behavior."""
+        from types import SimpleNamespace
+        import modules.processing as processing
+
+        p = SimpleNamespace(region_mask=Image.new('L', (64, 64), 255),
+                            _region_mask_cache={})
+        per_image, union = processing.get_region_masks_for_canvas(p, (128, 128))
+
+        assert per_image is None
+        assert union.size == (128, 128)
+        assert union.getextrema() == (255, 255)
+
+    def test_mask_list_returns_per_image_and_union(self):
+        """A mask list yields per-image masks plus their pixelwise union."""
+        from types import SimpleNamespace
+        import modules.processing as processing
+
+        left = Image.new('L', (128, 128), 0)
+        left.paste(255, (0, 0, 64, 128))
+        right = Image.new('L', (128, 128), 0)
+        right.paste(255, (64, 0, 128, 128))
+
+        p = SimpleNamespace(region_mask=[left, right], _region_mask_cache={})
+        per_image, union = processing.get_region_masks_for_canvas(p, (128, 128))
+
+        assert per_image is not None and len(per_image) == 2
+        assert per_image[0] is left and per_image[1] is right, \
+            "Canvas-sized masks must be reused without a resize copy"
+        assert union.getextrema() == (255, 255), \
+            "Union of complementary halves must cover the whole canvas"
+
+    def test_no_region_mask_returns_none_pair(self):
+        """Absent region mask (incl. non-guider processing) yields (None, None)."""
+        from types import SimpleNamespace
+        import modules.processing as processing
+
+        p = SimpleNamespace()
+        assert processing.get_region_masks_for_canvas(p, (128, 128)) == (None, None)
 
 
 class TestMaskedSkipUnit:

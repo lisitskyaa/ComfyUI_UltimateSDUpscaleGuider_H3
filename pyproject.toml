@@ -1,7 +1,7 @@
 [project]
 name = "comfyui-ultimatesdupscale-guider"
 description = "Tiled SD upscaling with custom Guider support: use PerpNegGuider for negative prompts at CFG 1 and higher quality upscales. Context Only Overlap lets each tile use already-generated neighbor pixels as context without re-denoising them, greatly improving consistency and removing seams. Masked Upscaling re-diffuses only a masked region and skips untouched tiles, so parts of an image can be upscaled with different models or settings, or an inpainted patch refined to match. The anchor_context option holds unprocessed areas to the original image during sampling, preventing detail drift between sections and blending seams into the real image. Fork of ComfyUI_UltimateSDUpscale."
-version = "1.2.0"
+version = "1.3.0"
 license = { file = "LICENSE" }
 
 [project.optional-dependencies]

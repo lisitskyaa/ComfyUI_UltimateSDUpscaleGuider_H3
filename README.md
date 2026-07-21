@@ -80,6 +80,7 @@ Both Guider nodes accept an optional `mask` input. White areas are re-diffused; 
 - **Full tile context.** Processed tiles still see the whole tile, so the re-diffused region blends with its real surroundings.
 - **Same feathering as tile seams.** The mask is feathered by `mask_blur`, and the edit extends about `mask_blur` pixels past the mask edge. Use `mask_blur=0` for a hard boundary.
 - **Any resolution.** The mask is resized to the upscaled canvas, so it can be drawn on the pre-upscale image. Grayscale values give partial blending.
+- **Batched images.** A batch of images works as usual. A single mask applies to every image in the batch; a batch of masks maps one mask to each image, so each image is edited only in its own region (a tile is sampled when any image in the batch needs it). With `anchor_context`, each image is anchored to its own original content.
 
 ### Anchoring Context (anchor_context)
 
@@ -95,7 +96,7 @@ In practice:
 ### Compatibility
 
 - Works with all three `tile_overlap_mode` values and all seam fix modes (seam fix passes are clipped to the masked region the same way).
-- Not compatible with `batch_size > 1`; the node raises an error. Use `batch_size=1` with a mask.
+- Not compatible with `batch_size > 1`; the node raises an error. Use `batch_size=1` with a mask. Note that `batch_size` is the number of *tiles* sampled per call — batched *images* are fully supported (see above).
 
 ### Use Case 1: Two-Stage Region Upscaling
 

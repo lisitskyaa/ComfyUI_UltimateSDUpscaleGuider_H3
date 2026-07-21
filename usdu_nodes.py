@@ -120,7 +120,7 @@ def USDU_guider_base_inputs():
     ]
 
     optional = [
-        ("mask", ("MASK", {"tooltip": "Optional region mask. Only masked (white) areas are re-diffused; tiles that do not touch the mask are skipped entirely, which greatly speeds up small-region upscales. Sampling still sees the full tile for context, and blending uses the same mask_blur feathering as tile edges (the edit extends about mask_blur pixels past the mask). The mask may be any resolution and is resized to the upscaled canvas. Grayscale values give partial blending. Not compatible with batch_size > 1."})),
+        ("mask", ("MASK", {"tooltip": "Optional region mask. Only masked (white) areas are re-diffused; tiles that do not touch the mask are skipped entirely, which greatly speeds up small-region upscales. Sampling still sees the full tile for context, and blending uses the same mask_blur feathering as tile edges (the edit extends about mask_blur pixels past the mask). The mask may be any resolution and is resized to the upscaled canvas. Grayscale values give partial blending. With batched images, a single mask applies to every image, and a batch of masks maps one mask to each image. Not compatible with batch_size > 1 (tile batching)."})),
         ("anchor_context", ("BOOLEAN", {"default": False, "tooltip": "Hold the areas a tile will not composite back to the original image at every sampling step, so the model sees the true surroundings instead of a re-diffused version that can drift. Keeps detail consistent between sections and blends seams into the real image. Takes effect when a mask is connected or tile_overlap_mode is 'Context Only Overlap'; otherwise it has no effect."})),
     ]
 
@@ -337,14 +337,23 @@ class UltimateSDUpscaleGuider:
         redraw_mode = MODES[mode_type]
         seam_fix_mode_enum = SEAM_FIX_MODES[seam_fix_mode]
 
-        # Convert the optional region mask to a PIL 'L' image
+        # Convert the optional region mask to PIL 'L' image(s). A single mask
+        # is shared by every image in the batch; a batch of masks maps one
+        # mask to each image (cyclically on mismatch, matching ComfyUI's
+        # repeat_to_batch_size convention).
         region_mask = None
         if mask is not None:
             if mask.dim() == 2:
                 mask = mask.unsqueeze(0)
-            if mask.shape[0] > 1:
-                logger.warning("Region mask batch size is %d; only the first mask is used for all images.", mask.shape[0])
-            region_mask = mask_tensor_to_pil(mask, 0)
+            num_images = len(image)
+            num_masks = mask.shape[0]
+            if num_masks == 1:
+                region_mask = mask_tensor_to_pil(mask, 0)
+            else:
+                if num_masks != num_images:
+                    logger.warning("Mask batch size (%d) does not match image batch size (%d); "
+                                   "mask[i %% num_masks] is used for image i.", num_masks, num_images)
+                region_mask = [mask_tensor_to_pil(mask, i % num_masks) for i in range(num_images)]
 
         # Processing with guider
         sdprocessing = StableDiffusionProcessingGuider(
