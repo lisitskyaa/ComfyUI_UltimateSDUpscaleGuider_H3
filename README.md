@@ -1,5 +1,8 @@
 # ComfyUI_UltimateSDUpscaleGuider
 
+> ⚠️ **DEPRECATED — succeeded by [ComfyUI-ContextAnchoredTileUpscale](https://github.com/Blakeem/ComfyUI-ContextAnchoredTileUpscale).**
+> The successor is a complete native rewrite of this pack's best path (Context Only Overlap + context anchoring, always on) with per-image mask batches, active-row batch sampling, and none of the legacy machinery. This repo remains available for existing workflows but will only receive critical fixes. Migration: `UltimateSDUpscaleGuider` → **Context-Anchored Tile Upscale**, `UltimateSDUpscaleNoUpscaleGuider` → **Context-Anchored Tile Refine**.
+
 > **A fork of [ComfyUI_UltimateSDUpscale](https://github.com/ssitu/ComfyUI_UltimateSDUpscale) with Guider support, Context Only Overlap, Masked Upscaling, and context anchoring.**
 
 [ComfyUI](https://github.com/comfyanonymous/ComfyUI) nodes for running the image-to-image diffusion process on large images in tiles. Tiling improves the detail commonly lost on upscaled images while keeping VRAM use low and the working size close to what the diffusion model was trained on.

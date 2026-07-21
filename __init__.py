@@ -61,6 +61,10 @@ for module in modules_used:
 # Proceed with node setup
 from .usdu_nodes import NODE_CLASS_MAPPINGS, NODE_DISPLAY_NAME_MAPPINGS
 
+logger.info("ComfyUI_UltimateSDUpscaleGuider is deprecated; its successor is "
+            "Context-Anchored Tile Upscale: "
+            "https://github.com/Blakeem/ComfyUI-ContextAnchoredTileUpscale")
+
 WEB_DIRECTORY = "./js"
 __all__ = ["NODE_CLASS_MAPPINGS", "NODE_DISPLAY_NAME_MAPPINGS"]
 
