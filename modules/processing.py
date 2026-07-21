@@ -9,6 +9,8 @@ from modules import shared
 from tqdm import tqdm
 import comfy.utils as comfy_utils
 import comfy.sample
+import comfy.model_management
+import latent_preview
 from enum import Enum
 from dataclasses import dataclass
 from typing import List, Optional
@@ -434,6 +436,9 @@ def sample_with_guider(guider, seed, sampler, sigmas, latent):
     # Get noise mask if present
     noise_mask = latent.get("noise_mask", None)
 
+    # Live latent previews and per-step progress in the ComfyUI frontend
+    callback = latent_preview.prepare_callback(guider.model_patcher, sigmas.shape[-1] - 1)
+
     # Call guider.sample() - the guider handles the denoising loop
     samples = guider.sample(
         noise,
@@ -441,10 +446,11 @@ def sample_with_guider(guider, seed, sampler, sigmas, latent):
         sampler,
         sigmas,
         denoise_mask=noise_mask,
-        callback=None,
+        callback=callback,
         disable_pbar=not comfy_utils.PROGRESS_BAR_ENABLED,
         seed=seed
     )
+    samples = samples.to(comfy.model_management.intermediate_device())
 
     # Return in latent dict format
     out = latent.copy()
