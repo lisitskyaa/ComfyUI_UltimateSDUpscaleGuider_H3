@@ -157,3 +157,4 @@ cython_debug/
 /test/test_images
 /.vscode
 config.json
+aipg/

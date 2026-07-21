@@ -96,6 +96,30 @@ class ProcessedRegionTracker:
 
         return full_mask
 
+
+def get_region_mask_for_canvas(p, canvas_size):
+    """Return p.region_mask resized to canvas_size ('L'), cached on p by size.
+
+    Returns None when no region mask is set (including non-guider processing).
+    canvas_size must be image_mask.size -- p.width/p.height hold the PER-TILE
+    processing size inside process_images, NOT the canvas size.
+    """
+    region_mask = getattr(p, 'region_mask', None)
+    if region_mask is None:
+        return None
+    cache = getattr(p, '_region_mask_cache', None)
+    if cache is None:
+        cache = p._region_mask_cache = {}
+    if canvas_size not in cache:
+        if region_mask.size == canvas_size:
+            cache[canvas_size] = region_mask
+        else:
+            # BILINEAR deliberately: monotone, no LANCZOS ringing on hard
+            # edges; mask_blur feathers afterwards.
+            cache[canvas_size] = region_mask.resize(canvas_size, Image.Resampling.BILINEAR)
+    return cache[canvas_size]
+
+
 class StableDiffusionProcessing:
 
     def __init__(
@@ -230,6 +254,7 @@ class StableDiffusionProcessingGuider:
         redraw_mode,
         seam_fix_mode,
         batch_size=1,
+        region_mask=None,
     ):
         # Variables used by the USDU script
         self.init_images = [init_img]
@@ -275,6 +300,9 @@ class StableDiffusionProcessingGuider:
         self.processed_tracker: Optional[ProcessedRegionTracker] = None
         self.tiled_decode = tiled_decode
         self.batch_size = batch_size
+        # Optional region mask (PIL 'L' image) limiting what is composited back
+        self.region_mask = region_mask
+        self._region_mask_cache = {}
         self.vae_decoder = VAEDecode()
         self.vae_encoder = VAEEncode()
         self.vae_decoder_tiled = VAEDecodeTiled()
@@ -425,6 +453,21 @@ def process_images(p: StableDiffusionProcessing) -> Processed:
         # No white pixels, nothing to process
         return Processed(p, [], p.seed, "")
 
+    # Optional region mask: clip the tile mask to the user region (composite-only).
+    # crop_region was already computed from the full tile rect above, so the
+    # sampled tile context is unchanged; the region only limits what is
+    # composited back (and lets non-intersecting tiles be skipped entirely).
+    region_mask = get_region_mask_for_canvas(p, image_mask.size)
+    if region_mask is not None:
+        combined = np.minimum(np.array(image_mask), np.array(region_mask))
+        if not combined.any():
+            # Tile does not touch the region: skip VAE encode + sampling,
+            # but still advance the progress bar so it completes.
+            if p.progress_bar_enabled and p.pbar is not None:
+                p.pbar.update(1)
+            return Processed(p, [], p.seed, "")
+        image_mask = Image.fromarray(combined, mode='L')
+
     if p.tile_overlap_mode == TileOverlapMode.IGNORE:
         # Current uniform_tile_mode=False behavior
         # Uses the minimal size that can fit the mask, minimizes tile size but may lead to image sizes that the model is not trained on
@@ -494,6 +537,12 @@ def process_images(p: StableDiffusionProcessing) -> Processed:
             final_bbox = image_mask.getbbox()
             if final_bbox:
                 p.processed_tracker.add_region(*final_bbox)
+            elif region_mask is not None:
+                # Region-white area lies entirely inside already-processed
+                # overlap: nothing would composite; skip the sample.
+                if p.progress_bar_enabled and p.pbar is not None:
+                    p.pbar.update(1)
+                return Processed(p, [], p.seed, "")
 
     # Blur the mask
     if p.mask_blur > 0:

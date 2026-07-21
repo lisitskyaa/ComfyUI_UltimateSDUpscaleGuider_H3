@@ -6,7 +6,7 @@ import torch
 import comfy
 import comfy.utils as comfy_utils
 from usdu_patch import usdu
-from usdu_utils import tensor_to_pil, pil_to_tensor
+from usdu_utils import tensor_to_pil, pil_to_tensor, mask_tensor_to_pil
 from modules.processing import StableDiffusionProcessing, StableDiffusionProcessingGuider, TileOverlapMode
 import modules.shared as shared
 from modules.upscaler import UpscalerData
@@ -119,7 +119,9 @@ def USDU_guider_base_inputs():
         ("batch_size", ("INT", {"default": 1, "min": 1, "max": 4096, "step": 1, "tooltip": "The number of tiles to process in a batch. Higher values can reduce processing time but use more VRAM. Yields different results than individual tiles. Only affects the main redraw step, not the seam fix step."})),
     ]
 
-    optional = []
+    optional = [
+        ("mask", ("MASK", {"tooltip": "Optional region mask. Only masked (white) areas are re-diffused; tiles that do not touch the mask are skipped entirely, which greatly speeds up small-region upscales. Sampling still sees the full tile for context, and blending uses the same mask_blur feathering as tile edges (the edit extends about mask_blur pixels past the mask). The mask may be any resolution and is resized to the upscaled canvas. Grayscale values give partial blending. Not compatible with batch_size > 1."})),
+    ]
 
     return required, optional
 
@@ -303,7 +305,8 @@ class UltimateSDUpscaleGuider:
     def upscale(self, image, guider, sampler, sigmas, vae, upscale_by, seed,
                 upscale_model, mode_type, tile_width, tile_height, mask_blur, tile_padding,
                 seam_fix_mode, seam_fix_denoise, seam_fix_mask_blur,
-                seam_fix_width, seam_fix_padding, tile_overlap_mode, tiled_decode, batch_size=1):
+                seam_fix_width, seam_fix_padding, tile_overlap_mode, tiled_decode, batch_size=1,
+                mask=None):
 
         tile_overlap_mode_enum = TILE_OVERLAP_MODES[tile_overlap_mode]
 
@@ -314,6 +317,9 @@ class UltimateSDUpscaleGuider:
         if batch_size > 1 and tile_overlap_mode_enum == TileOverlapMode.IGNORE:
             raise ValueError("batch_size > 1 requires uniform tile sizes. "
                              "Use 'Reprocess Overlap' or 'Context Only Overlap' mode.")
+        if mask is not None and batch_size > 1:
+            raise ValueError("mask is not compatible with batch_size > 1. "
+                             "The batched tile path does not support region masks; use batch_size=1.")
 
         #
         # Set up A1111 patches
@@ -330,12 +336,22 @@ class UltimateSDUpscaleGuider:
         redraw_mode = MODES[mode_type]
         seam_fix_mode_enum = SEAM_FIX_MODES[seam_fix_mode]
 
+        # Convert the optional region mask to a PIL 'L' image
+        region_mask = None
+        if mask is not None:
+            if mask.dim() == 2:
+                mask = mask.unsqueeze(0)
+            if mask.shape[0] > 1:
+                logger.warning("Region mask batch size is %d; only the first mask is used for all images.", mask.shape[0])
+            region_mask = mask_tensor_to_pil(mask, 0)
+
         # Processing with guider
         sdprocessing = StableDiffusionProcessingGuider(
             shared.batch[0], guider, sampler, sigmas, vae,
             seed, upscale_by, tile_overlap_mode_enum, tiled_decode,
             tile_width, tile_height, redraw_mode, seam_fix_mode_enum,
             batch_size,
+            region_mask=region_mask,
         )
 
         # Suppress logging to prevent duplicate tqdm progress bars
@@ -381,12 +397,14 @@ class UltimateSDUpscaleNoUpscaleGuider(UltimateSDUpscaleGuider):
     def upscale(self, upscaled_image, guider, sampler, sigmas, vae, seed,
                 mode_type, tile_width, tile_height, mask_blur, tile_padding,
                 seam_fix_mode, seam_fix_denoise, seam_fix_mask_blur,
-                seam_fix_width, seam_fix_padding, tile_overlap_mode, tiled_decode, batch_size=1):
+                seam_fix_width, seam_fix_padding, tile_overlap_mode, tiled_decode, batch_size=1,
+                mask=None):
         upscale_by = 1.0
         return super().upscale(upscaled_image, guider, sampler, sigmas, vae, upscale_by, seed,
                                None, mode_type, tile_width, tile_height, mask_blur, tile_padding,
                                seam_fix_mode, seam_fix_denoise, seam_fix_mask_blur,
-                               seam_fix_width, seam_fix_padding, tile_overlap_mode, tiled_decode, batch_size)
+                               seam_fix_width, seam_fix_padding, tile_overlap_mode, tiled_decode, batch_size,
+                               mask=mask)
 
 
 # A dictionary that contains all nodes you want to export with their names

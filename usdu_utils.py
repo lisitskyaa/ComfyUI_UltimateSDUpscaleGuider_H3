@@ -30,6 +30,12 @@ def pil_to_tensor(image):
     return image
 
 
+def mask_tensor_to_pil(mask_tensor, batch_index=0):
+    """Convert a ComfyUI MASK tensor [B, H, W] float 0..1 to a PIL 'L' image."""
+    m = torch.nan_to_num(mask_tensor[batch_index]).clamp(0.0, 1.0)
+    return Image.fromarray((255.0 * m.cpu().numpy()).astype(np.uint8), mode='L')
+
+
 def controlnet_hint_to_pil(tensor, batch_index=0):
     return tensor_to_pil(tensor.movedim(1, -1), batch_index)
 

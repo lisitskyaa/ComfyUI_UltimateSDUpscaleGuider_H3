@@ -85,6 +85,59 @@ For best results with Context Only Overlap mode:
 - `mask_blur` of 8-16 provides smooth blending at tile edges
 - Seam fix can typically be set to "None" since seams are prevented
 
+## Masked Upscaling
+
+Both Guider nodes accept an optional `mask` input (MASK type). White areas of the mask are
+re-diffused; black areas are left untouched. With no mask connected, behavior is identical to
+before.
+
+### How It Works
+
+- **Tile skipping is the speed win.** Tiles whose rectangle does not touch the mask are skipped
+  entirely — no VAE encode, no sampling. A mask covering a small region of a large image only pays
+  for the tiles it touches.
+- **Full tile context.** Tiles that do touch the mask are sampled exactly as without a mask — the
+  model sees the full tile, so the re-diffused region blends with real surroundings.
+- **Same feathering as tile seams.** The mask is intersected with each tile's own mask and
+  feathered by the existing `mask_blur`, so region boundaries blend with the exact same process
+  tile seams already use. Note the edit extends about `mask_blur` pixels past the mask edge; use
+  `mask_blur=0` for a hard boundary.
+- **Any resolution.** The mask may be any size (e.g. drawn on the pre-upscale image) and is
+  resized to the upscaled canvas. Grayscale values give partial blending.
+
+### Compatibility
+
+- Works with all three `tile_overlap_mode` values and all seam fix modes (seam fix passes are
+  clipped to the masked region the same way).
+- NOT compatible with `batch_size > 1` — the node raises an error; use `batch_size=1` with a mask.
+
+### Use Case 1: Two-Stage Region Upscaling
+
+Upscale the background and a character with different guider/sampler/sigmas each, in one chained
+workflow. Run the background pass first so the character pass sees the finished background as tile
+context:
+
+```
+[Mask] ──► [InvertMask] ──► mask ┐
+[Background Guider/Sampler/Sigmas] ┼──► [Ultimate SD Upscale (Guider)] ─┐
+[Image] ───────────────────────────┘                                    │
+                                                                        ▼
+[Mask] ────────────────────► mask ┬──► [Ultimate SD Upscale (No Upscale, Guider)] ──► IMAGE
+[Character Guider/Sampler/Sigmas] ┘
+```
+
+### Use Case 2: Upscale Inpainting for Huge Images
+
+Inpainting a huge image directly is expensive. Instead: downsample a copy, inpaint on the small
+copy, paste the upscaled patch back into the full-size image, then use the No Upscale node with a
+mask over the patched region to re-diffuse only that region so it matches the rest:
+
+```
+[Huge Image] ─► [Downscale] ─► [Inpaint] ─► [Upscale patch + paste back] ─┐
+                                                                          ▼
+[Patch-Region Mask] ─► mask ──► [Ultimate SD Upscale (No Upscale, Guider)] ──► IMAGE
+```
+
 ## Installation
 
 ### Using Git
