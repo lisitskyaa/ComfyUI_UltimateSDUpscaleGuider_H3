@@ -458,6 +458,163 @@ def sample_with_guider(guider, seed, sampler, sigmas, latent):
     return out
 
 
+# MiniMax H3 starting-latent tile V2V support
+# =========================================================================
+
+def _usdu_h3_startlatent_is_h3_guider(guider):
+    try:
+        model = guider.model_patcher.model
+        if model.__class__.__name__ == "MiniMaxH3":
+            return True
+        diffusion = getattr(model, "diffusion_model", None)
+        return (
+            diffusion is not None
+            and diffusion.__class__.__name__ == "MiniMaxH3Model"
+        )
+    except Exception:
+        return False
+
+
+def _usdu_h3_startlatent_target_frames(frame_count):
+    n = max(5, int(frame_count))
+    while n % 17 != 5:
+        n += 1
+    return n
+
+
+def _usdu_h3_startlatent_normalize_video_latent(video_latent):
+    """Normalize H3 video latent to [1,24,T,H,W], following FaceRefine logic."""
+    if video_latent.ndim == 4:
+        # Compatibility path used by H3 FaceRefine.
+        video_latent = video_latent.unsqueeze(0).movedim(1, 2).contiguous()
+    elif (
+        video_latent.ndim == 5
+        and video_latent.shape[0] > 1
+        and video_latent.shape[1] == 24
+        and video_latent.shape[2] == 1
+    ):
+        # Compatibility with VAE paths exposing time as batch.
+        logger.info(
+            "USDU H3 starting-latent: normalizing video latent %s to [1,24,T,H,W].",
+            tuple(video_latent.shape),
+        )
+        video_latent = video_latent.permute(2, 1, 0, 3, 4).contiguous()
+
+    if video_latent.ndim != 5 or video_latent.shape[0] != 1 or video_latent.shape[1] != 24:
+        raise ValueError(
+            "MiniMax H3 starting video latent must be [1,24,T,H,W]; got "
+            f"{tuple(video_latent.shape)}."
+        )
+
+    return video_latent
+
+
+def _usdu_h3_startlatent_match_template(video_latent, video_tmpl):
+    """Match encoded source-video latent to native H3 template geometry."""
+    if tuple(video_latent.shape[-2:]) != tuple(video_tmpl.shape[-2:]):
+        raise ValueError(
+            "H3 source-video latent spatial shape does not match native target geometry. "
+            f"encoded={tuple(video_latent.shape)}, native={tuple(video_tmpl.shape)}."
+        )
+
+    got_t = int(video_latent.shape[2])
+    tgt_t = int(video_tmpl.shape[2])
+
+    if got_t < tgt_t:
+        pad = video_tmpl[:, :, :tgt_t - got_t, :, :]
+        video_latent = torch.cat([video_latent, pad], dim=2)
+        logger.info(
+            "USDU H3 starting-latent: padded latent time %d -> %d using native empty template.",
+            got_t, tgt_t,
+        )
+    elif got_t > tgt_t:
+        video_latent = video_latent[:, :, :tgt_t, :, :]
+        logger.info(
+            "USDU H3 starting-latent: trimmed latent time %d -> %d to match native template.",
+            got_t, tgt_t,
+        )
+
+    if tuple(video_latent.shape) != tuple(video_tmpl.shape):
+        raise ValueError(
+            "H3 source-video latent still does not match native target geometry after adjustment. "
+            f"encoded={tuple(video_latent.shape)}, native={tuple(video_tmpl.shape)}."
+        )
+
+    return video_latent.to(video_tmpl.device, video_tmpl.dtype)
+
+
+def _usdu_h3_startlatent_build_noise_mask(video_latent, audio_latent):
+    import comfy.nested_tensor
+
+    video_mask = torch.ones_like(video_latent, device=video_latent.device, dtype=video_latent.dtype)
+    audio_mask = torch.zeros_like(audio_latent, device=audio_latent.device, dtype=audio_latent.dtype)
+    return comfy.nested_tensor.NestedTensor((video_mask, audio_mask))
+
+
+def _usdu_h3_startlatent_prepare(p, batched_tiles):
+    if batched_tiles.ndim != 4:
+        raise ValueError(
+            "USDU H3 starting-latent V2V expected [T,H,W,C], got "
+            f"{tuple(batched_tiles.shape)}"
+        )
+
+    source_frames = int(batched_tiles.shape[0])
+    height = int(batched_tiles.shape[1])
+    width = int(batched_tiles.shape[2])
+
+    if source_frames < 5:
+        raise ValueError(
+            f"USDU H3 starting-latent V2V requires at least 5 frames; got {source_frames}."
+        )
+
+    if width % 32 != 0 or height % 32 != 0:
+        raise ValueError(
+            "MiniMax H3 requires tile dimensions divisible by 32; "
+            f"got {width}x{height}."
+        )
+
+    target_frames = _usdu_h3_startlatent_target_frames(source_frames)
+
+    try:
+        from comfy_extras.nodes_minimax_h3 import _empty_av_latent
+        import comfy.nested_tensor
+    except Exception as exc:
+        raise RuntimeError(
+            "This patch requires native MiniMax H3 support in ComfyUI."
+        ) from exc
+
+    empty_latent, actual_frames = _empty_av_latent(
+        width, height, target_frames, batch_size=1
+    )
+
+    if actual_frames != target_frames:
+        raise RuntimeError(
+            "Native H3 latent builder returned an unexpected frame count: "
+            f"{actual_frames} instead of {target_frames}."
+        )
+
+    video_tmpl, audio_tmpl = empty_latent["samples"].unbind()
+
+    # FaceRefine-style injection: encode original clip as-is, then match native
+    # H3 template in latent space instead of padding pixel frames pre-VAE.
+    video_latent = p.vae.encode(batched_tiles[..., :3])
+    video_latent = _usdu_h3_startlatent_normalize_video_latent(video_latent)
+    video_latent = _usdu_h3_startlatent_match_template(video_latent, video_tmpl)
+
+    samples = comfy.nested_tensor.NestedTensor((video_latent, audio_tmpl))
+    noise_mask = _usdu_h3_startlatent_build_noise_mask(video_latent, audio_tmpl)
+
+    logger.info(
+        "USDU H3 starting-latent V2V: source=%d frames, target=%d frames, "
+        "video=%s, audio=%s (audio locked)",
+        source_frames,
+        target_frames,
+        tuple(video_latent.shape),
+        tuple(audio_tmpl.shape),
+    )
+
+    return {"samples": samples, "noise_mask": noise_mask}, source_frames
+
 def process_images(p: StableDiffusionProcessing) -> Processed:
     # Where the main image generation happens in A1111
 
@@ -603,15 +760,24 @@ def process_images(p: StableDiffusionProcessing) -> Processed:
         if tile.size != tile_size:
             tiles[i] = tile.resize(tile_size, Image.Resampling.LANCZOS)
 
-    # Encode the image
+    # Encode the image / video tile
     batched_tiles = torch.cat([pil_to_tensor(tile) for tile in tiles], dim=0)
-    (latent,) = p.vae_encoder.encode(p.vae, batched_tiles)
 
-    # Optional inpaint-style anchoring: give the sampler a denoise mask so the
-    # non-composited parts of the tile (masked-out areas, CONTEXT_ONLY
-    # already-processed overlap, and the tile-padding ring) are renoised from
-    # the original latent at every step instead of freely redrawn and discarded.
-    if getattr(p, 'anchor_context', False) and (
+    is_h3_startlatent_v2v = (
+        getattr(p, 'use_guider', False)
+        and _usdu_h3_startlatent_is_h3_guider(p.guider)
+    )
+
+    h3_source_frames = None
+
+    if is_h3_startlatent_v2v:
+        latent, h3_source_frames = _usdu_h3_startlatent_prepare(
+            p, batched_tiles
+        )
+    else:
+        (latent,) = p.vae_encoder.encode(p.vae, batched_tiles)
+
+    if (not is_h3_startlatent_v2v) and getattr(p, 'anchor_context', False) and (
             region_mask is not None
             or p.tile_overlap_mode == TileOverlapMode.CONTEXT_ONLY):
         anchor_masks = composite_masks if composite_masks is not None else [image_mask]
@@ -619,44 +785,53 @@ def process_images(p: StableDiffusionProcessing) -> Processed:
         for anchor_mask in anchor_masks:
             noise_mask = anchor_mask.crop(crop_region)
             if noise_mask.size != tile_size:
-                # BILINEAR deliberately: monotone, stays in [0, 1]; LANCZOS (used
-                # for the image tile) rings past the range on hard mask edges.
                 noise_mask = noise_mask.resize(tile_size, Image.Resampling.BILINEAR)
-            mask_tensor = torch.from_numpy(np.array(noise_mask).astype(np.float32) / 255.0)
-            # Binarize: fully denoise every pixel the composite can touch (any
-            # nonzero alpha, including the whole mask_blur feather band) and anchor
-            # only pixels the composite fully preserves. A grayscale denoise mask
-            # would re-anchor the feather band a fraction at EVERY step, which
-            # compounds across steps and leaves the band as an unrefined
-            # low-detail halo around the mask.
+            mask_tensor = torch.from_numpy(
+                np.array(noise_mask).astype(np.float32) / 255.0
+            )
             mask_rows.append((mask_tensor > 0.0).to(torch.float32))
-        # Same shape convention as ComfyUI's SetLatentNoiseMask: [B, 1, H, W].
-        # A single row broadcasts across the whole latent batch (ComfyUI's
-        # reshape_mask repeats it); per-image masks give one row per image,
-        # anchoring each image to its own original content.
+
         stacked = torch.stack(mask_rows)
-        latent["noise_mask"] = stacked.reshape((-1, 1, stacked.shape[-2], stacked.shape[-1]))
+        latent["noise_mask"] = stacked.reshape(
+            (-1, 1, stacked.shape[-2], stacked.shape[-1])
+        )
 
-    # Generate samples - use guider path or standard path
     if getattr(p, 'use_guider', False):
-        # Guider path: conditioning is internal to the guider, skip crop_cond
-        samples = sample_with_guider(p.guider, p.seed, p.sampler, p.sigmas, latent)
+        samples = sample_with_guider(
+            p.guider, p.seed, p.sampler, p.sigmas, latent
+        )
     else:
-        # Standard path: crop conditioning for each tile
-        positive_cropped = crop_cond(p.positive, crop_region, p.init_size, init_image.size, tile_size)
-        negative_cropped = crop_cond(p.negative, crop_region, p.init_size, init_image.size, tile_size)
-        samples = sample(p.model, p.seed, p.steps, p.cfg, p.sampler_name, p.scheduler, positive_cropped,
-                         negative_cropped, latent, p.denoise, p.custom_sampler, p.custom_sigmas)
+        positive_cropped = crop_cond(
+            p.positive, crop_region, p.init_size, init_image.size, tile_size
+        )
+        negative_cropped = crop_cond(
+            p.negative, crop_region, p.init_size, init_image.size, tile_size
+        )
+        samples = sample(
+            p.model, p.seed, p.steps, p.cfg,
+            p.sampler_name, p.scheduler,
+            positive_cropped, negative_cropped,
+            latent, p.denoise,
+            p.custom_sampler, p.custom_sigmas
+        )
 
-    # Update the progress bar
     if p.progress_bar_enabled and p.pbar is not None:
         p.pbar.update(1)
 
-    # Decode the sample
     if not p.tiled_decode:
         (decoded,) = p.vae_decoder.decode(p.vae, samples)
     else:
-        (decoded,) = p.vae_decoder_tiled.decode(p.vae, samples, 512)  # Default tile size is 512
+        (decoded,) = p.vae_decoder_tiled.decode(
+            p.vae, samples, 512
+        )
+
+    if is_h3_startlatent_v2v:
+        if len(decoded) < h3_source_frames:
+            raise RuntimeError(
+                "USDU H3 decoded fewer frames than the input clip: "
+                f"{len(decoded)} < {h3_source_frames}."
+            )
+        decoded = decoded[:h3_source_frames]
 
     # Convert the sample to a PIL image
     tiles_sampled = [tensor_to_pil(decoded, i) for i in range(len(decoded))]
