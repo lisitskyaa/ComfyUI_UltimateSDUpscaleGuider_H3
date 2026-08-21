@@ -613,7 +613,7 @@ def _usdu_h3_startlatent_prepare(p, batched_tiles):
         tuple(audio_tmpl.shape),
     )
 
-    return {"samples": samples, "noise_mask": noise_mask}, source_frames
+    return {"samples": samples}, source_frames
 
 def process_images(p: StableDiffusionProcessing) -> Processed:
     # Where the main image generation happens in A1111
