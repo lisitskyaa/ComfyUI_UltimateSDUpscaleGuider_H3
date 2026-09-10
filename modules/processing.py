@@ -4,7 +4,8 @@ import torch
 import math
 from nodes import common_ksampler, VAEEncode, VAEDecode, VAEDecodeTiled
 from comfy_extras.nodes_custom_sampler import SamplerCustom
-from usdu_utils import pil_to_tensor, tensor_to_pil, get_crop_region, expand_crop, crop_cond
+from usdu_utils import CroppedImages, pil_batch_to_tensor, tensor_to_pil, get_crop_region, expand_crop, crop_cond
+from usdu_canvas import composite_tile, frame_reference
 from modules import shared
 from tqdm import tqdm
 import comfy.utils as comfy_utils
@@ -13,6 +14,7 @@ import comfy.model_management
 import latent_preview
 from enum import Enum
 from dataclasses import dataclass
+import usdu_h3
 from typing import List, Optional
 import numpy as np
 import json
@@ -462,17 +464,7 @@ def sample_with_guider(guider, seed, sampler, sigmas, latent):
 # =========================================================================
 
 def _usdu_h3_startlatent_is_h3_guider(guider):
-    try:
-        model = guider.model_patcher.model
-        if model.__class__.__name__ == "MiniMaxH3":
-            return True
-        diffusion = getattr(model, "diffusion_model", None)
-        return (
-            diffusion is not None
-            and diffusion.__class__.__name__ == "MiniMaxH3Model"
-        )
-    except Exception:
-        return False
+    return usdu_h3.is_h3_guider(guider)
 
 
 def _usdu_h3_startlatent_target_frames(frame_count):
@@ -543,14 +535,6 @@ def _usdu_h3_startlatent_match_template(video_latent, video_tmpl):
     return video_latent.to(video_tmpl.device, video_tmpl.dtype)
 
 
-def _usdu_h3_startlatent_build_noise_mask(video_latent, audio_latent):
-    import comfy.nested_tensor
-
-    video_mask = torch.ones_like(video_latent, device=video_latent.device, dtype=video_latent.dtype)
-    audio_mask = torch.zeros_like(audio_latent, device=audio_latent.device, dtype=audio_latent.dtype)
-    return comfy.nested_tensor.NestedTensor((video_mask, audio_mask))
-
-
 def _usdu_h3_startlatent_prepare(p, batched_tiles):
     if batched_tiles.ndim != 4:
         raise ValueError(
@@ -602,11 +586,10 @@ def _usdu_h3_startlatent_prepare(p, batched_tiles):
     video_latent = _usdu_h3_startlatent_match_template(video_latent, video_tmpl)
 
     samples = comfy.nested_tensor.NestedTensor((video_latent, audio_tmpl))
-    noise_mask = _usdu_h3_startlatent_build_noise_mask(video_latent, audio_tmpl)
 
     logger.info(
         "USDU H3 starting-latent V2V: source=%d frames, target=%d frames, "
-        "video=%s, audio=%s (audio locked)",
+        "video=%s, audio=%s",
         source_frames,
         target_frames,
         tuple(video_latent.shape),
@@ -749,24 +732,16 @@ def process_images(p: StableDiffusionProcessing) -> Processed:
         else:
             image_mask = image_mask.filter(ImageFilter.GaussianBlur(p.mask_blur))
 
-    # Crop the images to get the tiles that will be used for generation
-    tiles = [img.crop(crop_region) for img in shared.batch]
-
-    # Assume the same size for all images in the batch
-    initial_tile_size = tiles[0].size
-
-    # Resize if necessary
-    for i, tile in enumerate(tiles):
-        if tile.size != tile_size:
-            tiles[i] = tile.resize(tile_size, Image.Resampling.LANCZOS)
-
-    # Encode the image / video tile
-    batched_tiles = torch.cat([pil_to_tensor(tile) for tile in tiles], dim=0)
-
+    # Crop/resize/convert one frame at a time into the VAE's float tile batch.
+    # The crop operation can extend beyond the source; retain PIL's padding.
+    initial_tile_size = (crop_region[2] - crop_region[0], crop_region[3] - crop_region[1])
     is_h3_startlatent_v2v = (
         getattr(p, 'use_guider', False)
         and _usdu_h3_startlatent_is_h3_guider(p.guider)
     )
+    padded_tile_size = usdu_h3.aligned_size(tile_size) if is_h3_startlatent_v2v else tile_size
+    batched_tiles = pil_batch_to_tensor(
+        CroppedImages(shared.batch, crop_region, tile_size, padded_tile_size))
 
     h3_source_frames = None
 
@@ -777,9 +752,19 @@ def process_images(p: StableDiffusionProcessing) -> Processed:
     else:
         (latent,) = p.vae_encoder.encode(p.vae, batched_tiles)
 
-    if (not is_h3_startlatent_v2v) and getattr(p, 'anchor_context', False) and (
+    # Sampling needs only the encoded tile, not the full temporal RGB batch.
+    del batched_tiles
+
+    anchor_active = getattr(p, 'anchor_context', False) and (
             region_mask is not None
-            or p.tile_overlap_mode == TileOverlapMode.CONTEXT_ONLY):
+            or p.tile_overlap_mode == TileOverlapMode.CONTEXT_ONLY)
+    if is_h3_startlatent_v2v and anchor_active:
+        anchor_masks = composite_masks if composite_masks is not None else [image_mask]
+        latent["noise_mask"] = usdu_h3.build_noise_mask(
+            latent["samples"],
+            masks=anchor_masks, source_frames=h3_source_frames,
+            crop_region=crop_region, tile_size=tile_size)
+    elif anchor_active:
         anchor_masks = composite_masks if composite_masks is not None else [image_mask]
         mask_rows = []
         for anchor_mask in anchor_masks:
@@ -815,6 +800,8 @@ def process_images(p: StableDiffusionProcessing) -> Processed:
             p.custom_sampler, p.custom_sigmas
         )
 
+    del latent
+
     if p.progress_bar_enabled and p.pbar is not None:
         p.pbar.update(1)
 
@@ -833,35 +820,19 @@ def process_images(p: StableDiffusionProcessing) -> Processed:
             )
         decoded = decoded[:h3_source_frames]
 
-    # Convert the sample to a PIL image
-    tiles_sampled = [tensor_to_pil(decoded, i) for i in range(len(decoded))]
-
-    for i, tile_sampled in enumerate(tiles_sampled):
-        init_image = shared.batch[i]
+    del samples
+    # Convert/composite one frame at a time, not another complete PIL clip.
+    for i in range(len(decoded)):
+        tile_sampled = tensor_to_pil(decoded, i)
+        if padded_tile_size != tile_size:
+            tile_sampled = tile_sampled.crop((0, 0, *tile_size))
         tile_mask = composite_masks[i] if composite_masks is not None else image_mask
 
         # Resize back to the original size
         if tile_sampled.size != initial_tile_size:
             tile_sampled = tile_sampled.resize(initial_tile_size, Image.Resampling.LANCZOS)
 
-        # Put the tile into position
-        image_tile_only = Image.new('RGBA', init_image.size)
-        image_tile_only.paste(tile_sampled, crop_region[:2])
+        composite_tile(shared.batch, i, tile_sampled, crop_region, tile_mask)
 
-        # Add the mask as an alpha channel
-        # Must make a copy due to the possibility of an edge becoming black
-        temp = image_tile_only.copy()
-        temp.putalpha(tile_mask)
-        image_tile_only.paste(temp, image_tile_only)
-
-        # Add back the tile to the initial image according to the mask in the alpha channel
-        result = init_image.convert('RGBA')
-        result.alpha_composite(image_tile_only)
-
-        # Convert back to RGB
-        result = result.convert('RGB')
-
-        shared.batch[i] = result
-
-    processed = Processed(p, [shared.batch[0]], p.seed, "")
+    processed = Processed(p, [frame_reference(shared.batch, 0)], p.seed, "")
     return processed

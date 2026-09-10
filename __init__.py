@@ -60,6 +60,11 @@ for module in modules_used:
 
 # Proceed with node setup
 from .usdu_nodes import NODE_CLASS_MAPPINGS, NODE_DISPLAY_NAME_MAPPINGS
+from .usdu_video import NODE_CLASS_MAPPINGS as VIDEO_NODE_CLASS_MAPPINGS
+from .usdu_video import NODE_DISPLAY_NAME_MAPPINGS as VIDEO_NODE_DISPLAY_NAME_MAPPINGS
+
+NODE_CLASS_MAPPINGS.update(VIDEO_NODE_CLASS_MAPPINGS)
+NODE_DISPLAY_NAME_MAPPINGS.update(VIDEO_NODE_DISPLAY_NAME_MAPPINGS)
 
 logger.info("ComfyUI_UltimateSDUpscaleGuider is deprecated; its successor is "
             "Context-Anchored Tile Upscale: "

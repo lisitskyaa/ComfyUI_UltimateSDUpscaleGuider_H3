@@ -2,8 +2,8 @@ import numpy as np
 from PIL import Image, ImageFilter
 import torch
 import torch.nn.functional as F
-from torchvision.transforms import GaussianBlur
 import math
+from usdu_canvas import frame_reference
 
 # Compatibility for older Pillow versions
 try:
@@ -17,17 +17,60 @@ BLUR_KERNEL_SIZE = 15
 def tensor_to_pil(img_tensor, batch_index=0):
     # Takes a batch of images in the form of a tensor of shape [batch_size, height, width, channels]
     # and returns an RGB PIL Image. Assumes channels=3
-    safe_tensor = torch.nan_to_num(img_tensor[batch_index])
+    safe_tensor = torch.nan_to_num(img_tensor[batch_index]).clamp(0.0, 1.0)
     return Image.fromarray((255 * safe_tensor.cpu().numpy()).astype(np.uint8))
 
 
 def pil_to_tensor(image):
     # Takes a PIL image and returns a tensor of shape [1, height, width, channels]
-    image = np.array(image).astype(np.float32) / 255.0
+    image = np.asarray(image).astype(np.float32) / 255.0
     image = torch.from_numpy(image).unsqueeze(0)
     if len(image.shape) == 3:  # If the image is grayscale, add a channel dimension
         image = image.unsqueeze(-1)
     return image
+
+
+def pil_batch_to_tensor(images):
+    """Assemble one float buffer, without a second full batch for torch.cat."""
+    if not images:
+        raise ValueError("Cannot convert an empty image batch.")
+    first = pil_to_tensor(images[0])
+    result = torch.empty((len(images), *first.shape[1:]),
+                         dtype=first.dtype, device=first.device)
+    result[0:1].copy_(first)
+    expected_shape = first.shape
+    del first
+    for index in range(1, len(images)):
+        frame = pil_to_tensor(images[index])
+        if frame.shape != expected_shape:
+            raise ValueError("All images in a batch must have the same shape.")
+        result[index:index + 1].copy_(frame)
+        del frame
+    return result
+
+
+class CroppedImages:
+    """Index a tile across the clip without retaining another PIL clip."""
+
+    def __init__(self, images, region, size, padded_size=None):
+        self.images = images
+        self.region = region
+        self.size = size
+        self.padded_size = padded_size or size
+
+    def __len__(self):
+        return len(self.images)
+
+    def __getitem__(self, index):
+        tile = frame_reference(self.images, index).crop(self.region)
+        if tile.size != self.size:
+            tile = tile.resize(self.size, Image.Resampling.LANCZOS)
+        if tile.size != self.padded_size:
+            pixels = np.asarray(tile)
+            padding = ((0, self.padded_size[1] - tile.height),
+                       (0, self.padded_size[0] - tile.width), (0, 0))
+            tile = Image.fromarray(np.pad(pixels, padding, mode="edge"))
+        return tile
 
 
 def mask_tensor_to_pil(mask_tensor, batch_index=0):

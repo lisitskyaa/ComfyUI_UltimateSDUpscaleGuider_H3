@@ -2,16 +2,39 @@
 
 import logging
 from contextlib import contextmanager
-import torch
+from functools import wraps
+from threading import RLock
 import comfy
 import comfy.utils as comfy_utils
+import usdu_h3
 from usdu_patch import usdu
-from usdu_utils import tensor_to_pil, pil_to_tensor, mask_tensor_to_pil
+from usdu_utils import tensor_to_pil, pil_batch_to_tensor, mask_tensor_to_pil
+from usdu_canvas import frame_reference
 from modules.processing import StableDiffusionProcessing, StableDiffusionProcessingGuider, TileOverlapMode
 import modules.shared as shared
 from modules.upscaler import UpscalerData
 
 logger = logging.getLogger(__name__)
+
+
+_RUN_LOCK = RLock()
+
+
+def release_run_buffers(function):
+    """Own the A1111 globals for one call, including setup failures/cancellation."""
+    @wraps(function)
+    def run(*args, **kwargs):
+        with _RUN_LOCK:
+            progress_enabled = comfy_utils.PROGRESS_BAR_ENABLED
+            try:
+                return function(*args, **kwargs)
+            finally:
+                shared.batch = []
+                shared.batch_as_tensor = None
+                shared.actual_upscaler = None
+                shared.sd_upscalers[0] = None
+                comfy_utils.PROGRESS_BAR_ENABLED = progress_enabled
+    return run
 
 
 @contextmanager
@@ -109,7 +132,7 @@ def USDU_guider_base_inputs():
         ("tile_padding", ("INT", {"default": 32, "min": 0, "max": MAX_RESOLUTION, "step": 8, "tooltip": "The padding to apply between tiles."})),
         # Seam fix params
         ("seam_fix_mode", (list(SEAM_FIX_MODES.keys()), {"tooltip": "The seam fix mode to use."})),
-        ("seam_fix_denoise", ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01, "tooltip": "The denoising strength to use for the seam fix."})),
+        ("seam_fix_denoise", ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01, "tooltip": "Legacy compatibility control; Guider sampling uses the main SIGMAS input for both tiles and seam repair."})),
         ("seam_fix_width", ("INT", {"default": 64, "min": 0, "max": MAX_RESOLUTION, "step": 8, "tooltip": "The width of the bands used for the Band Pass seam fix mode."})),
         ("seam_fix_mask_blur", ("INT", {"default": 8, "min": 0, "max": 64, "step": 1, "tooltip": "The blur radius for the seam fix mask."})),
         ("seam_fix_padding", ("INT", {"default": 16, "min": 0, "max": MAX_RESOLUTION, "step": 8, "tooltip": "The padding to apply for the seam fix tiles."})),
@@ -167,6 +190,7 @@ class UltimateSDUpscale:
     OUTPUT_TOOLTIPS = ("The final upscaled image.",)
     DESCRIPTION = "Upscales an image and runs image-to-image on tiles from the input image."
 
+    @release_run_buffers
     def upscale(self, image, model, positive, negative, vae, upscale_by, seed,
                 steps, cfg, sampler_name, scheduler, denoise, upscale_model,
                 mode_type, tile_width, tile_height, mask_blur, tile_padding,
@@ -208,7 +232,7 @@ class UltimateSDUpscale:
         with suppress_logging():
             try:
                 script = usdu.Script()
-                processed = script.run(p=sdprocessing, _=None, tile_width=tile_width, tile_height=tile_height,
+                script.run(p=sdprocessing, _=None, tile_width=tile_width, tile_height=tile_height,
                                    mask_blur=mask_blur, padding=tile_padding, seams_fix_width=seam_fix_width,
                                    seams_fix_denoise=seam_fix_denoise, seams_fix_padding=seam_fix_padding,
                                    upscaler_index=0, save_upscaled_image=False, redraw_mode=redraw_mode,
@@ -217,9 +241,7 @@ class UltimateSDUpscale:
                                    custom_width=None, custom_height=None, custom_scale=upscale_by)
 
                 # Return the resulting images
-                images = [pil_to_tensor(img) for img in shared.batch]
-                tensor = torch.cat(images, dim=0)
-                return (tensor,)
+                return (pil_batch_to_tensor(shared.batch),)
             finally:
                 # Restore progress bar (belt-and-suspenders with __del__)
                 if sdprocessing.progress_bar_enabled:
@@ -303,6 +325,13 @@ class UltimateSDUpscaleGuider:
     OUTPUT_TOOLTIPS = ("The final upscaled image.",)
     DESCRIPTION = "Upscales an image and runs image-to-image on tiles using a custom guider (e.g., PerpNegGuider, CFGGuider)."
 
+    def _prepare_images(self, image):
+        return [tensor_to_pil(image, i) for i in range(len(image))], image
+
+    def _finish_images(self, image):
+        return (pil_batch_to_tensor(shared.batch),)
+
+    @release_run_buffers
     def upscale(self, image, guider, sampler, sigmas, vae, upscale_by, seed,
                 upscale_model, mode_type, tile_width, tile_height, mask_blur, tile_padding,
                 seam_fix_mode, seam_fix_denoise, seam_fix_mask_blur,
@@ -310,6 +339,16 @@ class UltimateSDUpscaleGuider:
                 mask=None, anchor_context=False):
 
         tile_overlap_mode_enum = TILE_OVERLAP_MODES[tile_overlap_mode]
+
+        # Validate before decoding a VIDEO or building a full PIL canvas.
+        is_h3 = usdu_h3.is_h3_guider(guider)
+        if is_h3 and batch_size != 1:
+            raise ValueError("MiniMax H3 requires batch_size=1 (one spatial tile containing the clip). "
+                             "Spatial tile batching is not supported by the H3 video model.")
+        sampling_enabled = mode_type != "None" or seam_fix_mode != "None"
+        anchor_active = anchor_context and (mask is not None or tile_overlap_mode_enum == TileOverlapMode.CONTEXT_ONLY)
+        if is_h3 and sampling_enabled and anchor_active:
+            guider = usdu_h3.prepare_masked_guider(guider)
 
         # Validate batch_size incompatibilities
         if batch_size > 1 and tile_overlap_mode_enum == TileOverlapMode.CONTEXT_ONLY:
@@ -331,8 +370,9 @@ class UltimateSDUpscaleGuider:
         shared.actual_upscaler = upscale_model
 
         # Set the batch of images
-        shared.batch = [tensor_to_pil(image, i) for i in range(len(image))]
-        shared.batch_as_tensor = image
+        shared.batch, shared.batch_as_tensor = self._prepare_images(image)
+        if is_h3 and sampling_enabled and len(shared.batch) < 5:
+            raise ValueError("MiniMax H3 video refinement requires at least 5 frames.")
 
         redraw_mode = MODES[mode_type]
         seam_fix_mode_enum = SEAM_FIX_MODES[seam_fix_mode]
@@ -345,8 +385,10 @@ class UltimateSDUpscaleGuider:
         if mask is not None:
             if mask.dim() == 2:
                 mask = mask.unsqueeze(0)
-            num_images = len(image)
+            num_images = len(shared.batch)
             num_masks = mask.shape[0]
+            if num_masks == 0:
+                raise ValueError("The region mask must contain at least one frame.")
             if num_masks == 1:
                 region_mask = mask_tensor_to_pil(mask, 0)
             else:
@@ -357,7 +399,7 @@ class UltimateSDUpscaleGuider:
 
         # Processing with guider
         sdprocessing = StableDiffusionProcessingGuider(
-            shared.batch[0], guider, sampler, sigmas, vae,
+            frame_reference(shared.batch, 0), guider, sampler, sigmas, vae,
             seed, upscale_by, tile_overlap_mode_enum, tiled_decode,
             tile_width, tile_height, redraw_mode, seam_fix_mode_enum,
             batch_size,
@@ -369,7 +411,7 @@ class UltimateSDUpscaleGuider:
         with suppress_logging():
             try:
                 script = usdu.Script()
-                processed = script.run(p=sdprocessing, _=None, tile_width=tile_width, tile_height=tile_height,
+                script.run(p=sdprocessing, _=None, tile_width=tile_width, tile_height=tile_height,
                                    mask_blur=mask_blur, padding=tile_padding, seams_fix_width=seam_fix_width,
                                    seams_fix_denoise=seam_fix_denoise, seams_fix_padding=seam_fix_padding,
                                    upscaler_index=0, save_upscaled_image=False, redraw_mode=redraw_mode,
@@ -377,10 +419,8 @@ class UltimateSDUpscaleGuider:
                                    seams_fix_type=seam_fix_mode_enum, target_size_type=2,
                                    custom_width=None, custom_height=None, custom_scale=upscale_by)
 
-                # Return the resulting images
-                images = [pil_to_tensor(img) for img in shared.batch]
-                tensor = torch.cat(images, dim=0)
-                return (tensor,)
+                # Return through the transport hook while the run still owns its buffers.
+                return self._finish_images(image)
             finally:
                 # Restore progress bar (belt-and-suspenders with __del__)
                 if sdprocessing.progress_bar_enabled:
